@@ -1,341 +1,48 @@
-"""
-Bluesky API 封装工具
-提供认证、图片上传、发布推文等功能
-"""
+name: Bluesky Bot
 
-import logging
-from typing import Optional
-from atproto import Client
+on:
+  schedule:
+    # 上午10点发送（UTC时间，北京时间10:00）
+    - cron: '0 2 * * *'
+    # 下午4点发送（UTC时间，北京时间16:00）
+    - cron: '0 8 * * *'
 
-logger = logging.getLogger(__name__)
+  # 允许手动触发（用于测试）
+  workflow_dispatch:
 
+jobs:
+  send-tweet:
+    runs-on: ubuntu-latest
 
-class BlueskyClient:
-    """Bluesky客户端封装"""
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-    def __init__(self, handle: str, password: str):
-        """
-        初始化Bluesky客户端
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-        Args:
-            handle: Bluesky账号 (用户名或邮箱)
-            password: Bluesky密码 (建议使用应用密码)
-        """
-        self.handle = handle
-        self.password = password
-        self.client = Client()
-        self._profile = None
+      - name: 安装依赖
+        run: |
+          pip install atproto gspread APScheduler requests python-dotenv Pillow
 
-    def login(self) -> bool:
-        """
-        登录Bluesky
+      - name: 创建环境变量文件
+        env:
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+        run: |
+          echo "BLUESKY_HANDLE=$BLUESKY_HANDLE" > .env
+          echo "BLUESKY_PASSWORD=$BLUESKY_PASSWORD" >> .env
+          echo "GOOGLE_SPREADSHEET_ID=$GOOGLE_SPREADSHEET_ID" >> .env
+          echo "GOOGLE_CREDENTIALS_FILE=credentials.json" >> .env
 
-        Returns:
-            bool: 登录是否成功
-        """
-        try:
-            self._profile = self.client.login(
-                login=self.handle,
-                password=self.password
-            )
-            logger.info(f"Bluesky登录成功: {self._profile.handle}")
-            return True
-        except Exception as e:
-            logger.error(f"Bluesky登录失败: {str(e)}")
-            return False
+      - name: 创建Google凭证文件
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          echo "$GOOGLE_CREDENTIALS_JSON" > credentials.json
 
-    def _optimize_image(self, image_bytes: bytes, max_size_kb: int = 950) -> bytes:
-        """
-        优化图片，在保持高质量的同时压缩到指定大小
-
-        Args:
-            image_bytes: 原始图片二进制数据
-            max_size_kb: 最大文件大小（KB），默认950KB（Bluesky限制1MB）
-
-        Returns:
-            bytes: 优化后的图片二进制数据
-        """
-        from io import BytesIO
-        from PIL import Image
-
-        # 如果图片已经小于限制，直接返回
-        if len(image_bytes) <= max_size_kb * 1024:
-            logger.info(f"图片大小 {len(image_bytes)} bytes，无需压缩")
-            return image_bytes
-
-        logger.info(f"原始图片大小: {len(image_bytes)} bytes，开始优化...")
-
-        try:
-            # 打开图片
-            img = Image.open(BytesIO(image_bytes))
-
-            # 转换为RGB模式（去除透明通道，减少文件大小）
-            if img.mode in ('RGBA', 'LA', 'P'):
-                # 创建白色背景
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                # 如果是RGBA模式，使用alpha通道作为蒙版
-                if img.mode == 'RGBA':
-                    background.paste(img, mask=img.split()[3])
-                else:
-                    background.paste(img)
-                img = background
-
-            # 检查尺寸，Bluesky最大支持2000x2000
-            max_dimension = 2000
-            if img.width > max_dimension or img.height > max_dimension:
-                # 计算缩放比例，保持宽高比
-                ratio = min(max_dimension / img.width, max_dimension / img.height)
-                new_width = int(img.width * ratio)
-                new_height = int(img.height * ratio)
-                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                logger.info(f"图片尺寸调整为: {new_width}x{new_height}")
-
-            # 尝试不同质量参数，找到满足大小限制的最高质量
-            output = BytesIO()
-            quality = 95  # 从最高质量开始
-
-            while quality >= 70:  # 最低质量70
-                output = BytesIO()
-                img.save(output, format='JPEG', quality=quality, optimize=True)
-                optimized_bytes = output.getvalue()
-
-                if len(optimized_bytes) <= max_size_kb * 1024:
-                    logger.info(f"优化完成: 质量={quality}, 大小={len(optimized_bytes)} bytes")
-                    return optimized_bytes
-
-                quality -= 5  # 每次降低5
-
-            # 如果所有质量都太大，使用最后一次尝试
-            logger.warning(f"无法压缩到 {max_size_kb}KB，使用质量 {quality}")
-            return optimized_bytes
-
-        except Exception as e:
-            logger.error(f"图片优化失败: {str(e)}")
-            # 如果优化失败，返回原始图片
-            return image_bytes
-
-    def send_post_with_image(
-        self,
-        text: str,
-        image_bytes: bytes,
-        image_alt: str = "TOC Image",
-        facets: list = None
-    ) -> Optional[str]:
-        """
-        发布带图片的推文
-
-        注意：Bluesky限制一条推文只能有一个embed，因此有图片时无法同时显示链接预览卡片。
-
-        Args:
-            text: 推文文本
-            image_bytes: 图片二进制数据
-            image_alt: 图片alt文本
-            facets: rich text facets（用于创建链接等）
-
-        Returns:
-            Optional[str]: 推文URI，失败返回None
-        """
-        try:
-            from datetime import datetime, timezone
-            from io import BytesIO
-            from PIL import Image
-
-            # 优化图片，保持高质量
-            optimized_image = self._optimize_image(image_bytes)
-
-            # 获取图片的实际尺寸和宽高比
-            img = Image.open(BytesIO(optimized_image))
-            width, height = img.size
-            logger.info(f"图片尺寸: {width}x{height}, 宽高比: {width}:{height}")
-
-            # 简化宽高比（除以最大公约数）
-            from math import gcd
-            aspect_ratio = {
-                "$type": "app.bsky.embed.defs#aspectRatio",
-                "width": width // gcd(width, height),
-                "height": height // gcd(width, height)
-            }
-            logger.info(f"简化宽高比: {aspect_ratio['width']}:{aspect_ratio['height']}")
-
-            # 先上传图片
-            image_upload = self.client.upload_blob(optimized_image)
-
-            # 创建图片嵌入，包含宽高比信息
-            embed = {
-                "$type": "app.bsky.embed.images",
-                "images": [
-                    {
-                        "alt": image_alt,
-                        "image": image_upload.blob,
-                        "aspectRatio": aspect_ratio
-                    }
-                ]
-            }
-
-            # 生成创建时间（ISO 8601格式，UTC时区）
-            created_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-
-            # 发送推文，包含图片和facets
-            # 注意：Bluesky不能同时有图片embed和external embed
-            record_data = {
-                "$type": "app.bsky.feed.post",
-                "text": text,
-                "createdAt": created_at,
-                "embed": embed
-            }
-            if facets:
-                record_data["facets"] = facets
-
-            response = self.client.com.atproto.repo.create_record(
-                {
-                    "collection": "app.bsky.feed.post",
-                    "repo": self.client.me.did,
-                    "record": record_data
-                }
-            )
-
-            post_uri = response.uri
-            logger.info(f"推文发布成功: {post_uri}")
-            return post_uri
-        except Exception as e:
-            logger.error(f"推文发布失败: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
-    def send_post(self, text: str, facets: list = None, external_url: str = None) -> Optional[str]:
-        """
-        发布推文，支持链接预览卡片
-
-        Args:
-            text: 推文文本
-            facets: rich text facets（用于创建链接等）
-            external_url: 外部链接URL（用于生成预览卡片）
-
-        Returns:
-            Optional[str]: 推文URI，失败返回None
-        """
-        try:
-            from datetime import datetime, timezone
-
-            # 如果有external_url，创建external embed
-            embed = None
-            if external_url:
-                embed = {
-                    "$type": "app.bsky.embed.external",
-                    "external": {
-                        "uri": external_url,
-                        "title": "",
-                        "description": "",
-                    }
-                }
-                logger.info(f"创建External Embed，URL: {external_url}")
-
-            # 生成创建时间（ISO 8601格式，UTC时区）
-            created_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-
-            # 尝试使用facets参数
-            if facets or embed:
-                record_data = {
-                    "$type": "app.bsky.feed.post",
-                    "text": text,
-                    "createdAt": created_at,
-                }
-                if facets:
-                    record_data["facets"] = facets
-                if embed:
-                    record_data["embed"] = embed
-
-                response = self.client.com.atproto.repo.create_record(
-                    {
-                        "collection": "app.bsky.feed.post",
-                        "repo": self.client.me.did,
-                        "record": record_data
-                    }
-                )
-            else:
-                response = self.client.send_post(text=text)
-            post_uri = response.uri
-            logger.info(f"推文发布成功: {post_uri}")
-            return post_uri
-        except Exception as e:
-            logger.error(f"推文发布失败: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
-    def delete_post(self, post_uri: str) -> bool:
-        """
-        删除推文
-
-        Args:
-            post_uri: 推文URI
-
-        Returns:
-            bool: 删除是否成功
-        """
-        try:
-            result = self.client.delete_post(post_uri=post_uri)
-            logger.info(f"推文删除成功: {post_uri}")
-            return result
-        except Exception as e:
-            logger.error(f"推文删除失败: {str(e)}")
-            return False
-
-
-def create_bluesky_post_text(title: str, doi_link: str) -> str:
-    """
-    创建Bluesky推文文本
-
-    Args:
-        title: 文章标题
-        doi_link: DOI链接
-
-    Returns:
-        str: 推文文本
-    """
-    # Bluesky会自动识别URL为可点击的链接
-    return f"{title}\n\nDOI: {doi_link}"
-
-
-def create_post_facets(text: str, doi_link: str) -> list:
-    """
-    创建推文的facets（rich text features），用于明确标记URL为可点击链接
-
-    Args:
-        text: 推文文本
-        doi_link: DOI链接
-
-    Returns:
-        list: facets列表
-    """
-    import re
-
-    # 查找DOI链接在文本中的位置
-    # 查找 "DOI: " 后面的URL
-    pattern = r'DOI:\s*(https?://[^\s]+)'
-    match = re.search(pattern, text)
-
-    if not match:
-        return []
-
-    # 获取URL的起始和结束位置
-    uri_start = match.start(1)
-    uri_end = match.end(1)
-
-    # 创建facet
-    facet = {
-        "$type": "app.bsky.richtext.facet",
-        "features": [
-            {
-                "$type": "app.bsky.richtext.facet#link",
-                "uri": doi_link
-            }
-        ],
-        "index": {
-            "byteStart": uri_start,
-            "byteEnd": uri_end
-        }
-    }
-
-    return [facet]
+      - name: 运行发送程序
+        run: python send_post.py
