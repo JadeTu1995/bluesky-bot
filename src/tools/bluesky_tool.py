@@ -44,6 +44,105 @@ class BlueskyClient:
             logger.error(f"Bluesky登录失败: {str(e)}")
             return False
 
+    def _optimize_image(self, image_bytes: bytes, max_size_kb: int = 950) -> bytes:
+        """
+        优化图片，尽量保持原始质量，只在必要时调整尺寸
+
+        Args:
+            image_bytes: 原始图片二进制数据
+            max_size_kb: 最大文件大小（KB），默认950KB（Bluesky限制1MB）
+
+        Returns:
+            bytes: 优化后的图片二进制数据
+        """
+        from io import BytesIO
+        from PIL import Image
+
+        # 打开图片获取信息
+        img = Image.open(BytesIO(image_bytes))
+        width, height = img.size
+        logger.info(f"原始图片: {width}x{height}, 大小: {len(image_bytes)} bytes")
+
+        # 检查尺寸限制（Bluesky最大2000x2000）
+        max_dimension = 2000
+        need_resize = False
+
+        if img.width > max_dimension or img.height > max_dimension:
+            need_resize = True
+            # 计算缩放比例，保持宽高比
+            ratio = min(max_dimension / img.width, max_dimension / img.height)
+            new_width = int(img.width * ratio)
+            new_height = int(img.height * ratio)
+            logger.info(f"图片尺寸超过限制，调整为: {new_width}x{new_height}")
+
+        # 检查文件大小限制（Bluesky最大1MB）
+        need_compress = False
+        if len(image_bytes) > max_size_kb * 1024:
+            need_compress = True
+            logger.info(f"图片大小超过限制 ({len(image_bytes)} bytes > {max_size_kb * 1024} bytes)")
+
+        # 如果都不需要处理，直接返回原图
+        if not need_resize and not need_compress:
+            logger.info(f"图片符合要求，直接使用原图")
+            return image_bytes
+
+        try:
+            # 转换为RGB模式（去除透明通道，如果需要）
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'RGBA':
+                    background.paste(img, mask=img.split()[3])
+                else:
+                    background.paste(img)
+                img = background
+                logger.info(f"转换为RGB模式")
+
+            # 如果需要调整尺寸
+            if need_resize:
+                ratio = min(max_dimension / img.width, max_dimension / img.height)
+                new_width = int(img.width * ratio)
+                new_height = int(img.height * ratio)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.info(f"尺寸调整为: {new_width}x{new_height}")
+
+            # 如果需要压缩（只在必要时）
+            if need_compress:
+                # 先尝试保存当前尺寸
+                output = BytesIO()
+                img.save(output, format='JPEG', quality=100, optimize=False)
+                optimized_bytes = output.getvalue()
+
+                # 如果调整尺寸后已经符合大小要求，直接使用
+                if len(optimized_bytes) <= max_size_kb * 1024:
+                    logger.info(f"调整尺寸后符合要求，使用质量100: {len(optimized_bytes)} bytes")
+                    return optimized_bytes
+
+                # 如果还是太大，才降低质量
+                quality = 100
+                while quality >= 85 and len(optimized_bytes) > max_size_kb * 1024:
+                    output = BytesIO()
+                    img.save(output, format='JPEG', quality=quality, optimize=False)
+                    optimized_bytes = output.getvalue()
+                    quality -= 5
+
+                if len(optimized_bytes) <= max_size_kb * 1024:
+                    logger.info(f"优化完成: 质量={quality}, 大小={len(optimized_bytes)} bytes")
+                else:
+                    logger.warning(f"无法压缩到 {max_size_kb}KB，使用质量 {quality}")
+                return optimized_bytes
+            else:
+                # 只调整尺寸，不压缩质量
+                output = BytesIO()
+                img.save(output, format='JPEG', quality=100, optimize=False)
+                optimized_bytes = output.getvalue()
+                logger.info(f"只调整尺寸，使用质量100: {len(optimized_bytes)} bytes")
+                return optimized_bytes
+
+        except Exception as e:
+            logger.error(f"图片处理失败: {str(e)}")
+            # 如果处理失败，返回原始图片
+            return image_bytes
+
     def send_post_with_image(
         self,
         text: str,
@@ -67,17 +166,37 @@ class BlueskyClient:
         """
         try:
             from datetime import datetime, timezone
+            from io import BytesIO
+            from PIL import Image
+
+            # 优化图片，保持高质量
+            optimized_image = self._optimize_image(image_bytes)
+
+            # 获取图片的实际尺寸和宽高比
+            img = Image.open(BytesIO(optimized_image))
+            width, height = img.size
+            logger.info(f"图片尺寸: {width}x{height}, 宽高比: {width}:{height}")
+
+            # 简化宽高比（除以最大公约数）
+            from math import gcd
+            aspect_ratio = {
+                "$type": "app.bsky.embed.defs#aspectRatio",
+                "width": width // gcd(width, height),
+                "height": height // gcd(width, height)
+            }
+            logger.info(f"简化宽高比: {aspect_ratio['width']}:{aspect_ratio['height']}")
 
             # 先上传图片
-            image_upload = self.client.upload_blob(image_bytes)
+            image_upload = self.client.upload_blob(optimized_image)
 
-            # 创建图片嵌入 - 直接传递blob对象
+            # 创建图片嵌入，包含宽高比信息
             embed = {
                 "$type": "app.bsky.embed.images",
                 "images": [
                     {
                         "alt": image_alt,
-                        "image": image_upload.blob
+                        "image": image_upload.blob,
+                        "aspectRatio": aspect_ratio
                     }
                 ]
             }
