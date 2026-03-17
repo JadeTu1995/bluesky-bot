@@ -137,20 +137,37 @@ class BlueskyClient:
         """
         try:
             from datetime import datetime, timezone
+            from io import BytesIO
+            from PIL import Image
 
             # 优化图片，保持高质量
             optimized_image = self._optimize_image(image_bytes)
 
+            # 获取图片的实际尺寸和宽高比
+            img = Image.open(BytesIO(optimized_image))
+            width, height = img.size
+            logger.info(f"图片尺寸: {width}x{height}, 宽高比: {width}:{height}")
+
+            # 简化宽高比（除以最大公约数）
+            from math import gcd
+            aspect_ratio = {
+                "$type": "app.bsky.embed.defs#aspectRatio",
+                "width": width // gcd(width, height),
+                "height": height // gcd(width, height)
+            }
+            logger.info(f"简化宽高比: {aspect_ratio['width']}:{aspect_ratio['height']}")
+
             # 先上传图片
             image_upload = self.client.upload_blob(optimized_image)
 
-            # 创建图片嵌入 - 直接传递blob对象
+            # 创建图片嵌入，包含宽高比信息
             embed = {
                 "$type": "app.bsky.embed.images",
                 "images": [
                     {
                         "alt": image_alt,
-                        "image": image_upload.blob
+                        "image": image_upload.blob,
+                        "aspectRatio": aspect_ratio
                     }
                 ]
             }
