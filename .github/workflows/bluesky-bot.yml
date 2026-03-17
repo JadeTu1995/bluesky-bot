@@ -3,9 +3,9 @@ name: Bluesky Bot
 on:
   schedule:
     # 上午10点发送（UTC时间，北京时间10:00）
-    - cron: '0 2 * * *'
+    - cron: '0 0 * * *'
     # 下午4点发送（UTC时间，北京时间16:00）
-    - cron: '0 8 * * *'
+    - cron: '0 6 * * *'
 
   # 允许手动触发（用于测试）
   workflow_dispatch:
